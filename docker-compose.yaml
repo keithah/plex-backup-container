@@ -1,0 +1,89 @@
+services:
+  # Plex Media Server
+  plex:
+    image: plexinc/pms-docker:latest
+    container_name: plex
+    restart: unless-stopped
+    networks:
+      - hadm
+    ports:
+      - "32400:32400"
+    environment:
+      - TZ=America/Los_Angeles
+      - PLEX_CLAIM=claim-token-here  # Replace with your claim token
+      - ADVERTISE_IP=http://your-server-ip:32400  # Replace with your server IP
+    volumes:
+      - ./config:/config
+      - /path/to/media:/data  # Replace with your media path
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # Plex Backup Container
+  plex-backup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plex-backup
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      - hadm
+    depends_on:
+      - plex
+    environment:
+      - TZ=America/Los_Angeles
+      - HOSTNAME=${HOSTNAME}
+      - BACKUP_SCHEDULE=0 2 * * *  # Daily at 2 AM
+      - PLEX_CONTAINER=plex
+      - CONFIG_PATH=/config
+      - NFS_SERVER=hadm.net
+      - NFS_PATH=/storage
+      - NFS_MOUNT=/mnt/nfs
+      - BACKUP_PATH=/storage/backups/docker
+      # Optional notification URL for backup status
+      # - NOTIFICATION_URL=https://your-webhook-url
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Docker API access
+      - ./config:/config:ro  # Plex config directory (read-only for backup)
+      - ./logs:/var/log/backup  # Backup logs
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # Existing services from original compose file
+  homebridge-ffmpeg-intel:
+    image: keithah/homebridge-ffmpeg-intel:latest
+    container_name: homebridge-ffmpeg-intel
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    group_add:
+      - "44"
+    volumes:
+      - ./homebridge:/homebridge
+      - /usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/dri:ro
+      - /lib/firmware:/lib/firmware:ro
+      - /dev:/dev
+    environment:
+      - TZ=America/Los_Angeles
+      - HOMEBRIDGE_CONFIG_UI_PORT=8581
+      - ENABLE_AVAHI=1
+      - HOMEBRIDGE_CONFIG_UI=1
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower-homebridge
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_SCHEDULE=0 0 4 * * *  # Check daily at 4 AM
+      - WATCHTOWER_LABEL_ENABLE=true
+
+networks:
+  hadm:
+    external: true

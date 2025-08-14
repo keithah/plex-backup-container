@@ -36,7 +36,7 @@ services:
       - TZ=America/Los_Angeles
       - HOSTNAME=${HOSTNAME}
       - BACKUP_SCHEDULE=0 2 * * *  # Daily at 2 AM
-      - CONFIG_PATH=/config
+      - CONFIG_PATH=/config/plex  # Updated to match actual Plex config path
       - NFS_SERVER=hadm.net
       - NFS_PATH=/storage
       - NFS_MOUNT=/mnt/nfs
@@ -44,7 +44,7 @@ services:
       # - NOTIFICATION_URL=https://your-webhook-url
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Docker API access
-      - ./config:/config:ro  # Plex config directory (read-only for backup)
+      - /config:/config:ro  # Mount entire config directory (read-only for backup)
       - ./logs:/var/log/backup  # Backup logs
     labels:
       - "com.centurylinklabs.watchtower.enable=true"

@@ -7,7 +7,7 @@ set -e
 
 # Configuration
 HOSTNAME="${HOSTNAME:-$(hostname)}"
-CONFIG_PATH="${CONFIG_PATH:-/config}"
+CONFIG_PATH="${CONFIG_PATH:-/config/plex}"  # Updated to match actual Plex config path
 NFS_SERVER="${NFS_SERVER:-hadm.net}"
 NFS_PATH="${NFS_PATH:-/storage}"
 NFS_MOUNT="${NFS_MOUNT:-/mnt/nfs}"
@@ -20,19 +20,16 @@ declare -A CONTAINER_TYPES
 declare -a ALL_CONTAINERS
 declare -a STOPPED_CONTAINERS
 
-# Container configurations
-# Format: "image_pattern:config_path:db_path_relative_to_config:needs_maintenance"
+# Container configurations based on actual docker-compose setup
+# Format: "image_pattern:config_host_path:db_path_relative_to_config:needs_maintenance:description"
 CONTAINER_CONFIGS=(
-    "plex:/config:Library/Application Support/Plex Media Server/Plug-in Support/Databases:true"
-    "tautulli:/config:tautulli.db:false"
-    "overseerr:/config:db/db.sqlite3:false"
-    "sonarr:/config:sonarr.db:false"
-    "radarr:/config:radarr.db:false"
-    "prowlarr:/config:prowlarr.db:false"
-    "readarr:/config:readarr.db:false"
-    "bazarr:/config:db/bazarr.db:false"
-    "jellyfin:/config:data/jellyfin.db:false"
-    "emby:/config:data/library.db:false"
+    "plex:/config/plex:Library/Application Support/Plex Media Server/Plug-in Support/Databases:true:Plex Media Server"
+    "tautulli:/config/tautulli:tautulli.db:false:Plex Statistics and Monitoring"
+    "netdata:/config/netdata:netdatadb:false:System Monitoring (netdata databases)"
+    "caddy:/config/caddy:Caddyfile:false:Reverse Proxy Configuration"
+    "tailscale:/config/tailscale:tailscaled.state:false:VPN State File"
+    "watchtower:none:none:false:Container Updater (no config backup needed)"
+    "autoheal:none:none:false:Container Health Monitor (no config backup needed)"
 )
 
 # Logging function
@@ -90,7 +87,13 @@ discover_containers() {
     
     # Process each container configuration
     for config in "${CONTAINER_CONFIGS[@]}"; do
-        IFS=':' read -r pattern config_path db_path needs_maint <<< "$config"
+        IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
+        
+        # Skip containers that don't need backup
+        if [[ "$config_path" == "none" ]]; then
+            log "Skipping $pattern - $description (no backup needed)"
+            continue
+        fi
         
         # Find all containers matching this pattern
         while IFS= read -r line; do
@@ -99,10 +102,10 @@ discover_containers() {
                 image=$(echo "$line" | cut -d' ' -f2-)
                 
                 # Store container with its type info
-                CONTAINER_TYPES["$container"]="$pattern:$config_path:$db_path:$needs_maint"
+                CONTAINER_TYPES["$container"]="$pattern:$config_path:$db_path:$needs_maint:$description"
                 ALL_CONTAINERS+=("$container")
                 
-                log "Found $pattern container: $container (image: $image)"
+                log "Found $pattern container: $container ($description) - Image: $image"
             fi
         done < <(docker ps -a --format "{{.Names}} {{.Image}}" | grep -i "$pattern")
     done
@@ -111,7 +114,7 @@ discover_containers() {
         error_exit "No containers found matching configured patterns"
     fi
     
-    log "Total containers found: ${#ALL_CONTAINERS[@]}"
+    log "Total containers discovered for backup: ${#ALL_CONTAINERS[@]}"
 }
 
 # Function to stop container with timeout
@@ -152,7 +155,7 @@ empty_plex_trash() {
     fi
 }
 
-# Function to copy container databases while stopped
+# Function to copy container databases/config files while stopped
 copy_container_databases() {
     local container="$1"
     local backup_target="$2"
@@ -164,35 +167,71 @@ copy_container_databases() {
         return
     fi
     
-    IFS=':' read -r pattern config_path db_path needs_maint <<< "$config"
+    IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
     
-    # Handle different database patterns
-    if [[ "$db_path" == *"/"* ]]; then
-        # Path contains directory structure
-        local db_dir=$(dirname "$db_path")
-        local full_db_path="$config_path/$db_path"
-        local backup_db_dir="$backup_target/$container/databases"
-        
-        mkdir -p "$backup_db_dir"
-        
-        if [[ -f "$full_db_path" ]]; then
-            log "Copying database for $container: $full_db_path"
-            cp -v "$full_db_path"* "$backup_db_dir/" 2>/dev/null || true
-        else
-            log "WARNING: Database not found for $container at: $full_db_path"
-        fi
-    else
-        # Simple database file in config root
-        local backup_db_dir="$backup_target/$container/databases"
-        mkdir -p "$backup_db_dir"
-        
-        if [[ -f "$config_path/$db_path" ]]; then
-            log "Copying database for $container: $config_path/$db_path"
-            cp -v "$config_path/$db_path"* "$backup_db_dir/" 2>/dev/null || true
-        else
-            log "WARNING: Database not found for $container at: $config_path/$db_path"
-        fi
-    fi
+    log "Copying critical files for $container ($description)"
+    
+    # Create backup directory for this container
+    local container_backup_dir="$backup_target/$container"
+    mkdir -p "$container_backup_dir"
+    
+    # Handle different file types based on container
+    case "$pattern" in
+        "plex")
+            # Plex: Copy entire database directory
+            local db_full_path="$config_path/$db_path"
+            if [[ -d "$(dirname "$db_full_path")" ]]; then
+                log "Copying Plex databases: $db_full_path"
+                mkdir -p "$container_backup_dir/databases"
+                find "$(dirname "$db_full_path")" -name "*.db*" -type f -exec cp -v {} "$container_backup_dir/databases/" \; 2>/dev/null || true
+            else
+                log "WARNING: Plex database directory not found: $(dirname "$db_full_path")"
+            fi
+            ;;
+        "tautulli")
+            # Tautulli: Copy SQLite database
+            if [[ -f "$config_path/$db_path" ]]; then
+                log "Copying Tautulli database: $config_path/$db_path"
+                cp -v "$config_path/$db_path"* "$container_backup_dir/" 2>/dev/null || true
+            else
+                log "WARNING: Tautulli database not found: $config_path/$db_path"
+            fi
+            ;;
+        "netdata")
+            # Netdata: Copy database directory
+            if [[ -d "$config_path/lib" ]]; then
+                log "Copying Netdata databases"
+                mkdir -p "$container_backup_dir/databases"
+                find "$config_path/lib" -name "*.db*" -type f -exec cp -v {} "$container_backup_dir/databases/" \; 2>/dev/null || true
+                # Also copy registry files
+                find "$config_path/lib/registry" -type f -exec cp -v {} "$container_backup_dir/databases/" \; 2>/dev/null || true
+            else
+                log "WARNING: Netdata database directory not found: $config_path/lib"
+            fi
+            ;;
+        "caddy")
+            # Caddy: Copy important config files
+            if [[ -d "$config_path" ]]; then
+                log "Copying Caddy configuration and certificates"
+                # Copy certificates and config
+                rsync -av "$config_path/" "$container_backup_dir/" --exclude="*.log" --exclude="locks" 2>/dev/null || true
+            else
+                log "WARNING: Caddy config directory not found: $config_path"
+            fi
+            ;;
+        "tailscale")
+            # Tailscale: Copy state file
+            if [[ -f "$config_path/$db_path" ]]; then
+                log "Copying Tailscale state: $config_path/$db_path"
+                cp -v "$config_path/$db_path" "$container_backup_dir/" 2>/dev/null || true
+            else
+                log "WARNING: Tailscale state file not found: $config_path/$db_path"
+            fi
+            ;;
+        *)
+            log "WARNING: Unknown container pattern: $pattern"
+            ;;
+    esac
 }
 
 # Function to perform Plex-specific database maintenance
@@ -251,31 +290,72 @@ verify_backup() {
     
     log "=== Verifying backup integrity ==="
     
-    # Check critical Plex files
+    # Check critical Plex files (from rsync backup)
     if [[ -f "$backup_target/Preferences.xml" ]]; then
-        log "✓ Preferences.xml present"
+        log "✓ Plex Preferences.xml present"
     else
-        log "✗ WARNING: Preferences.xml missing!"
+        log "✗ WARNING: Plex Preferences.xml missing!"
         ((errors++))
     fi
     
     if [[ -d "$backup_target/Metadata" ]]; then
-        log "✓ Metadata directory present"
+        log "✓ Plex Metadata directory present"
     else
-        log "✗ WARNING: Metadata directory missing!"
+        log "✗ WARNING: Plex Metadata directory missing!"
         ((errors++))
     fi
     
-    # Check for container-specific databases
+    # Check for container-specific critical files
     for container in "${ALL_CONTAINERS[@]}"; do
-        if [[ -d "$backup_target/$container/databases" ]]; then
-            local db_count=$(find "$backup_target/$container/databases" -name "*.db" -type f | wc -l)
-            if [ "$db_count" -gt 0 ]; then
-                log "✓ $container: $db_count database(s) backed up"
-            else
-                log "✗ WARNING: No databases found for $container"
-                ((errors++))
-            fi
+        local config="${CONTAINER_TYPES[$container]}"
+        IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
+        
+        if [[ -d "$backup_target/$container" ]]; then
+            case "$pattern" in
+                "plex")
+                    local db_count=$(find "$backup_target/$container/databases" -name "*.db" -type f 2>/dev/null | wc -l)
+                    if [ "$db_count" -gt 0 ]; then
+                        log "✓ $container: $db_count Plex database(s) backed up"
+                    else
+                        log "✗ WARNING: No Plex databases found for $container"
+                        ((errors++))
+                    fi
+                    ;;
+                "tautulli")
+                    if [[ -f "$backup_target/$container/tautulli.db" ]]; then
+                        log "✓ $container: Tautulli database backed up"
+                    else
+                        log "✗ WARNING: Tautulli database missing for $container"
+                        ((errors++))
+                    fi
+                    ;;
+                "netdata")
+                    local db_count=$(find "$backup_target/$container/databases" -name "*.db*" -type f 2>/dev/null | wc -l)
+                    if [ "$db_count" -gt 0 ]; then
+                        log "✓ $container: $db_count Netdata database(s) backed up"
+                    else
+                        log "⚠ INFO: No Netdata databases found for $container (may be normal)"
+                    fi
+                    ;;
+                "caddy")
+                    if [[ -d "$backup_target/$container" ]]; then
+                        log "✓ $container: Caddy configuration backed up"
+                    else
+                        log "✗ WARNING: Caddy configuration missing for $container"
+                        ((errors++))
+                    fi
+                    ;;
+                "tailscale")
+                    if [[ -f "$backup_target/$container/tailscaled.state" ]]; then
+                        log "✓ $container: Tailscale state backed up"
+                    else
+                        log "⚠ INFO: Tailscale state missing for $container (may be normal if not configured)"
+                    fi
+                    ;;
+            esac
+        else
+            log "✗ WARNING: No backup directory found for $container"
+            ((errors++))
         fi
     done
     
@@ -353,14 +433,14 @@ for container in "${ALL_CONTAINERS[@]}"; do
     
     # Get container configuration
     config="${CONTAINER_TYPES[$container]}"
-    IFS=':' read -r pattern config_path db_path needs_maint <<< "$config"
+    IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
     
     # Perform maintenance if needed (only Plex containers for now)
     if [[ "$needs_maint" == "true" ]] && [[ "$pattern" == "plex" ]]; then
         perform_plex_maintenance "$config_path" "$container"
     fi
     
-    # Copy databases while container is stopped
+    # Copy critical files while container is stopped
     copy_container_databases "$container" "$BACKUP_TARGET"
 done
 

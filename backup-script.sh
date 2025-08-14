@@ -7,7 +7,7 @@ set -e
 
 # Configuration
 HOSTNAME="${HOSTNAME:-$(hostname)}"
-CONFIG_PATH="${CONFIG_PATH:-/config/plex}"  # Updated to match actual Plex config path
+CONFIG_BASE_PATH="${CONFIG_BASE_PATH:-/config}"  # Base config directory
 NFS_SERVER="${NFS_SERVER:-hadm.net}"
 NFS_PATH="${NFS_PATH:-/storage}"
 NFS_MOUNT="${NFS_MOUNT:-/mnt/nfs}"
@@ -15,22 +15,15 @@ LOG_FILE="/var/log/backup/backup.log"
 LOCK_FILE="/var/run/multi-container-backup.lock"
 HISTORY_FILE="$NFS_MOUNT/backups/docker/.backup-history.csv"
 
-# Arrays to track containers by type
-declare -A CONTAINER_TYPES
+# Arrays to track containers and databases
+declare -A CONTAINER_TO_CONFIG_PATH
+declare -A DATABASE_FILES
 declare -a ALL_CONTAINERS
 declare -a STOPPED_CONTAINERS
 
-# Container configurations based on actual docker-compose setup
-# Format: "image_pattern:config_host_path:db_path_relative_to_config:needs_maintenance:description"
-CONTAINER_CONFIGS=(
-    "plex:/config/plex:Library/Application Support/Plex Media Server/Plug-in Support/Databases:true:Plex Media Server"
-    "tautulli:/config/tautulli:tautulli.db:false:Plex Statistics and Monitoring"
-    "netdata:/config/netdata:netdatadb:false:System Monitoring (netdata databases)"
-    "caddy:/config/caddy:Caddyfile:false:Reverse Proxy Configuration"
-    "tailscale:/config/tailscale:tailscaled.state:false:VPN State File"
-    "watchtower:none:none:false:Container Updater (no config backup needed)"
-    "autoheal:none:none:false:Container Health Monitor (no config backup needed)"
-)
+# Container to config path mapping (will be populated from docker-compose.yml)
+declare -A CONTAINER_TO_CONFIG_PATH
+COMPOSE_FILE="${COMPOSE_FILE:-/config/docker-compose.yaml}"
 
 # Logging function
 log() {
@@ -81,40 +74,130 @@ check_available_space() {
     log "Available space on $mount_point: ${available_space}GB"
 }
 
-# Function to discover containers by type
-discover_containers() {
-    log "Discovering containers by image type..."
+# Function to parse docker-compose.yml and extract volume mappings
+parse_compose_file() {
+    log "Parsing docker-compose file: $COMPOSE_FILE"
     
-    # Process each container configuration
-    for config in "${CONTAINER_CONFIGS[@]}"; do
-        IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        log "WARNING: Docker-compose file not found at $COMPOSE_FILE"
+        return 1
+    fi
+    
+    # Extract container volume mappings using basic parsing
+    # Look for volume mappings like "/config/something:/config"
+    local current_service=""
+    local in_volumes_section=false
+    
+    while IFS= read -r line; do
+        # Remove leading whitespace
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
         
-        # Skip containers that don't need backup
-        if [[ "$config_path" == "none" ]]; then
-            log "Skipping $pattern - $description (no backup needed)"
+        # Skip comments and empty lines
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        
+        # Detect service names (not indented, ends with :)
+        if [[ "$line" =~ ^[a-zA-Z0-9_-]+:$ ]]; then
+            current_service=$(echo "$line" | sed 's/:$//')
+            in_volumes_section=false
             continue
         fi
         
-        # Find all containers matching this pattern
-        while IFS= read -r line; do
-            if [[ -n "$line" ]]; then
-                container=$(echo "$line" | cut -d' ' -f1)
-                image=$(echo "$line" | cut -d' ' -f2-)
-                
-                # Store container with its type info
-                CONTAINER_TYPES["$container"]="$pattern:$config_path:$db_path:$needs_maint:$description"
-                ALL_CONTAINERS+=("$container")
-                
-                log "Found $pattern container: $container ($description) - Image: $image"
+        # Detect volumes section
+        if [[ "$line" == "volumes:" ]]; then
+            in_volumes_section=true
+            continue
+        fi
+        
+        # Reset volumes section when we hit another section
+        if [[ "$line" =~ ^[a-z_]+:$ ]] && [[ "$line" != "volumes:" ]]; then
+            in_volumes_section=false
+        fi
+        
+        # Parse volume mappings
+        if [[ "$in_volumes_section" == true && -n "$current_service" ]]; then
+            # Look for lines like "- /config/something:/config"
+            if [[ "$line" =~ ^-[[:space:]]+(/config/[^:]+):/config ]]; then
+                local host_path="${BASH_REMATCH[1]}"
+                CONTAINER_TO_CONFIG_PATH["$current_service"]="$host_path"
+                log "Mapped container '$current_service' to config path: $host_path"
             fi
-        done < <(docker ps -a --format "{{.Names}} {{.Image}}" | grep -i "$pattern")
-    done
+        fi
+    done < "$COMPOSE_FILE"
+    
+    log "Parsed ${#CONTAINER_TO_CONFIG_PATH[@]} container-to-config mappings from compose file"
+}
+
+# Function to discover all containers and their config paths
+discover_containers() {
+    log "Discovering all running containers..."
+    
+    # First parse the compose file to get config mappings
+    parse_compose_file
+    
+    # Get all running containers
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            container=$(echo "$line" | cut -d' ' -f1)
+            image=$(echo "$line" | cut -d' ' -f2-)
+            
+            ALL_CONTAINERS+=("$container")
+            log "Found container: $container (Image: $image)"
+        fi
+    done < <(docker ps -a --format "{{.Names}} {{.Image}}")
     
     if [ ${#ALL_CONTAINERS[@]} -eq 0 ]; then
-        error_exit "No containers found matching configured patterns"
+        error_exit "No containers found"
     fi
     
-    log "Total containers discovered for backup: ${#ALL_CONTAINERS[@]}"
+    log "Total containers discovered: ${#ALL_CONTAINERS[@]}"
+}
+
+# Function to scan for database files across all config directories
+scan_database_files() {
+    log "Scanning for database files in $CONFIG_BASE_PATH..."
+    
+    # Common database file patterns
+    local db_patterns=("*.db" "*.sqlite" "*.sqlite3" "*.db-*")
+    
+    for pattern in "${db_patterns[@]}"; do
+        while IFS= read -r db_file; do
+            if [[ -n "$db_file" ]]; then
+                # Store database file path
+                DATABASE_FILES["$db_file"]="pending"
+                log "Found database: $db_file"
+            fi
+        done < <(find "$CONFIG_BASE_PATH" -name "$pattern" -type f 2>/dev/null)
+    done
+    
+    log "Total database files found: ${#DATABASE_FILES[@]}"
+}
+
+# Function to determine which container owns a config path
+find_container_for_path() {
+    local config_path="$1"
+    
+    # Check our known mappings first
+    for container in "${!CONTAINER_TO_CONFIG_PATH[@]}"; do
+        if [[ "$config_path" == "${CONTAINER_TO_CONFIG_PATH[$container]}"* ]]; then
+            echo "$container"
+            return 0
+        fi
+    done
+    
+    # Try to infer from path structure (e.g., /config/someapp -> someapp container)
+    local path_component=$(echo "$config_path" | sed "s|^$CONFIG_BASE_PATH/||" | cut -d'/' -f1)
+    
+    # Check if a container with this name exists
+    for container in "${ALL_CONTAINERS[@]}"; do
+        if [[ "$container" == "$path_component" ]]; then
+            echo "$container"
+            return 0
+        fi
+    done
+    
+    # Return empty if no container found
+    echo ""
+    return 1
 }
 
 # Function to stop container with timeout
@@ -155,83 +238,38 @@ empty_plex_trash() {
     fi
 }
 
-# Function to copy container databases/config files while stopped
-copy_container_databases() {
-    local container="$1"
-    local backup_target="$2"
+# Function to copy database files while containers are stopped
+copy_database_files() {
+    local backup_target="$1"
     
-    # Get container configuration
-    local config="${CONTAINER_TYPES[$container]}"
-    if [[ -z "$config" ]]; then
-        log "WARNING: No configuration found for container $container"
-        return
-    fi
+    log "=== Copying database files while containers are stopped ==="
     
-    IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
+    # Create databases backup directory
+    local db_backup_dir="$backup_target/databases"
+    mkdir -p "$db_backup_dir"
     
-    log "Copying critical files for $container ($description)"
-    
-    # Create backup directory for this container
-    local container_backup_dir="$backup_target/$container"
-    mkdir -p "$container_backup_dir"
-    
-    # Handle different file types based on container
-    case "$pattern" in
-        "plex")
-            # Plex: Copy entire database directory
-            local db_full_path="$config_path/$db_path"
-            if [[ -d "$(dirname "$db_full_path")" ]]; then
-                log "Copying Plex databases: $db_full_path"
-                mkdir -p "$container_backup_dir/databases"
-                find "$(dirname "$db_full_path")" -name "*.db*" -type f -exec cp -v {} "$container_backup_dir/databases/" \; 2>/dev/null || true
-            else
-                log "WARNING: Plex database directory not found: $(dirname "$db_full_path")"
+    # Copy all discovered database files
+    for db_file in "${!DATABASE_FILES[@]}"; do
+        if [[ "${DATABASE_FILES[$db_file]}" == "pending" ]]; then
+            log "Copying database file: $db_file"
+            
+            # Create subdirectory structure to preserve paths
+            local relative_path=$(echo "$db_file" | sed "s|^$CONFIG_BASE_PATH/||")
+            local db_dest_dir="$db_backup_dir/$(dirname "$relative_path")"
+            mkdir -p "$db_dest_dir"
+            
+            # Copy the database file and any related files (WAL, SHM, etc.)
+            cp -v "$db_file" "$db_dest_dir/" 2>/dev/null || true
+            
+            # Copy related files (SQLite WAL and SHM files)
+            if [[ "$db_file" =~ \.db$ ]]; then
+                cp -v "${db_file}-wal" "$db_dest_dir/" 2>/dev/null || true
+                cp -v "${db_file}-shm" "$db_dest_dir/" 2>/dev/null || true
             fi
-            ;;
-        "tautulli")
-            # Tautulli: Copy SQLite database
-            if [[ -f "$config_path/$db_path" ]]; then
-                log "Copying Tautulli database: $config_path/$db_path"
-                cp -v "$config_path/$db_path"* "$container_backup_dir/" 2>/dev/null || true
-            else
-                log "WARNING: Tautulli database not found: $config_path/$db_path"
-            fi
-            ;;
-        "netdata")
-            # Netdata: Copy database directory
-            if [[ -d "$config_path/lib" ]]; then
-                log "Copying Netdata databases"
-                mkdir -p "$container_backup_dir/databases"
-                find "$config_path/lib" -name "*.db*" -type f -exec cp -v {} "$container_backup_dir/databases/" \; 2>/dev/null || true
-                # Also copy registry files
-                find "$config_path/lib/registry" -type f -exec cp -v {} "$container_backup_dir/databases/" \; 2>/dev/null || true
-            else
-                log "WARNING: Netdata database directory not found: $config_path/lib"
-            fi
-            ;;
-        "caddy")
-            # Caddy: Copy important config files
-            if [[ -d "$config_path" ]]; then
-                log "Copying Caddy configuration and certificates"
-                # Copy certificates and config
-                rsync -av "$config_path/" "$container_backup_dir/" --exclude="*.log" --exclude="locks" 2>/dev/null || true
-            else
-                log "WARNING: Caddy config directory not found: $config_path"
-            fi
-            ;;
-        "tailscale")
-            # Tailscale: Copy state file
-            if [[ -f "$config_path/$db_path" ]]; then
-                log "Copying Tailscale state: $config_path/$db_path"
-                cp -v "$config_path/$db_path" "$container_backup_dir/" 2>/dev/null || true
-            else
-                log "WARNING: Tailscale state file not found: $config_path/$db_path"
-            fi
-            ;;
-        *)
-            log "WARNING: Unknown container pattern: $pattern"
-            ;;
-    esac
+            
+            DATABASE_FILES["$db_file"]="copied"
+        fi
+    done
 }
 
 # Function to perform Plex-specific database maintenance
@@ -380,11 +418,42 @@ if ! docker ps >/dev/null 2>&1; then
     error_exit "Cannot access Docker daemon. Is docker.sock mounted?"
 fi
 
-# Discover all configured containers
+# Discover all containers and scan for databases
 discover_containers
+scan_database_files
 
-# Check which containers are running and stop them
-for container in "${ALL_CONTAINERS[@]}"; do
+# Determine which containers need to be stopped for database files
+log "=== Determining containers to stop for database backup ==="
+containers_to_stop=()
+
+for db_file in "${!DATABASE_FILES[@]}"; do
+    # Find which container config path contains this database
+    container=$(find_container_for_path "$db_file")
+    
+    if [[ -n "$container" ]]; then
+        log "Database $db_file belongs to container: $container"
+        # Add to stop list if not already there
+        if [[ ! " ${containers_to_stop[@]} " =~ " ${container} " ]]; then
+            containers_to_stop+=("$container")
+        fi
+    else
+        log "WARNING: Could not determine container for database: $db_file"
+    fi
+done
+
+# Also stop containers that have explicit config mappings (they likely have data)
+for container in "${!CONTAINER_TO_CONFIG_PATH[@]}"; do
+    if [[ ! " ${containers_to_stop[@]} " =~ " ${container} " ]]; then
+        containers_to_stop+=("$container")
+        log "Adding container with config mapping: $container"
+    fi
+done
+
+log "Containers to stop for database backup: ${containers_to_stop[*]}"
+
+# Stop containers that need database backup
+for container in "${containers_to_stop[@]}"; do
+    # Check if container exists and is running
     if docker ps --format "{{.Names}}" | grep -q "^${container}$"; then
         if stop_container_with_timeout "$container"; then
             STOPPED_CONTAINERS+=("$container")
@@ -393,7 +462,7 @@ for container in "${ALL_CONTAINERS[@]}"; do
             log "WARNING: Failed to stop container: $container"
         fi
     else
-        log "Container $container is already stopped"
+        log "Container $container is not running or doesn't exist"
     fi
 done
 
@@ -425,26 +494,17 @@ BACKUP_TARGET="$NFS_MOUNT/backups/docker/$HOSTNAME"
 mkdir -p "$BACKUP_TARGET"
 log "Backup target: $BACKUP_TARGET"
 
-# Perform container-specific maintenance and database copying
-log "=== Processing container maintenance and database backups ==="
-
-for container in "${ALL_CONTAINERS[@]}"; do
-    log "--- Processing container: $container ---"
-    
-    # Get container configuration
-    config="${CONTAINER_TYPES[$container]}"
-    IFS=':' read -r pattern config_path db_path needs_maint description <<< "$config"
-    
-    # Perform maintenance if needed (only Plex containers for now)
-    if [[ "$needs_maint" == "true" ]] && [[ "$pattern" == "plex" ]]; then
-        perform_plex_maintenance "$config_path" "$container"
+# Perform Plex maintenance if Plex container was stopped
+for container in "${STOPPED_CONTAINERS[@]}"; do
+    if [[ "$container" == "plex" ]] && [[ -n "${CONTAINER_TO_CONFIG_PATH[$container]}" ]]; then
+        log "=== Running Plex maintenance ==="
+        perform_plex_maintenance "${CONTAINER_TO_CONFIG_PATH[$container]}" "$container"
+        break
     fi
-    
-    # Copy critical files while container is stopped
-    copy_container_databases "$container" "$BACKUP_TARGET"
 done
 
-log "Database operations completed for all containers"
+# Copy all database files while containers are stopped
+copy_database_files "$BACKUP_TARGET"
 
 # Start all stopped containers back up
 for container in "${STOPPED_CONTAINERS[@]}"; do
@@ -471,50 +531,57 @@ if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
     done
 fi
 
-# Perform rsync backup of the remaining config files (excluding databases already copied)
-log "=== Starting rsync backup of remaining config files ==="
+# Perform rsync backup of the entire /config directory
+log "=== Starting rsync backup of entire config directory ==="
 
-# Create exclude file for rsync (excluding databases we already copied)
+# Create exclude file for rsync (excluding cache/temp files but INCLUDING databases since they're backed up separately)
 EXCLUDE_FILE="/tmp/rsync_excludes"
 cat > "$EXCLUDE_FILE" << EOF
-Cache/
-Codecs/
-Crash Reports/
-Diagnostics/
-Logs/
-Updates/
+*/Cache/
+*/cache/
+*/Codecs/
+*/Crash Reports/
+*/Diagnostics/
+*/Logs/
+*/logs/
+*/Updates/
+*/tmp/
+*/temp/
 *.log
 *.tmp
 *.lock
 *.backup.*
 *.corrupted.*
-Plug-in Support/Caches/
-Plug-in Support/Databases/
-Plug-in Support/Data/com.plexapp.system/DataItems/
-Media/localhost/
+*/Plug-in Support/Caches/
+*/Plug-in Support/Data/com.plexapp.system/DataItems/
+*/Media/localhost/
+*/transcodes/
+*/Transcode Sessions/
+databases/
 EOF
 
 # Skip backup if config path doesn't exist
-if [[ ! -d "$CONFIG_PATH" ]]; then
-    error_exit "Config path does not exist: $CONFIG_PATH"
+if [[ ! -d "$CONFIG_BASE_PATH" ]]; then
+    error_exit "Config base path does not exist: $CONFIG_BASE_PATH"
 fi
 
-log "Syncing remaining config files to: $BACKUP_TARGET"
-log "Note: SQLite databases already copied while containers were stopped"
+log "Syncing entire config directory: $CONFIG_BASE_PATH"
+log "Target: $BACKUP_TARGET"
+log "Note: Database files are backed up separately to preserve integrity"
 
-# Simple rsync - sync everything except databases (which we already copied)
+# Complete rsync of entire /config directory
 rsync_cmd=(
     rsync
     -av
     --delete
     --delete-excluded
     --exclude-from="$EXCLUDE_FILE"
-    "$CONFIG_PATH/"
+    "$CONFIG_BASE_PATH/"
     "$BACKUP_TARGET/"
 )
 
 if "${rsync_cmd[@]}"; then
-    log "Rsync backup of config files completed successfully"
+    log "Rsync backup of entire config directory completed successfully"
     
     # Get backup size
     BACKUP_SIZE=$(du -sh "$BACKUP_TARGET" 2>/dev/null | cut -f1)
@@ -523,7 +590,7 @@ else
     error_exit "Rsync backup failed"
 fi
 
-log "Config directory synchronization completed successfully"
+log "Complete config directory backup finished"
 
 # Cleanup temporary files
 rm -f "$EXCLUDE_FILE"

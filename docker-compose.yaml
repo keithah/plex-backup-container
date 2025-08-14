@@ -36,7 +36,8 @@ services:
       - TZ=America/Los_Angeles
       - HOSTNAME=${HOSTNAME}
       - BACKUP_SCHEDULE=0 2 * * *  # Daily at 2 AM
-      - CONFIG_PATH=/config/plex  # Updated to match actual Plex config path
+      - CONFIG_BASE_PATH=/config  # Base config directory (backs up everything)
+      - COMPOSE_FILE=/config/docker-compose.yaml  # Path to docker-compose file
       - NFS_SERVER=hadm.net
       - NFS_PATH=/storage
       - NFS_MOUNT=/mnt/nfs

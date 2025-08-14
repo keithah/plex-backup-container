@@ -36,12 +36,10 @@ services:
       - TZ=America/Los_Angeles
       - HOSTNAME=${HOSTNAME}
       - BACKUP_SCHEDULE=0 2 * * *  # Daily at 2 AM
-      - PLEX_CONTAINER_PATTERN=plex  # Pattern to match Plex containers (e.g., "plex" matches plex, plex-1, etc.)
       - CONFIG_PATH=/config
       - NFS_SERVER=hadm.net
       - NFS_PATH=/storage
       - NFS_MOUNT=/mnt/nfs
-      - BACKUP_PATH=/storage/backups/docker
       # Optional notification URL for backup status
       # - NOTIFICATION_URL=https://your-webhook-url
     volumes:

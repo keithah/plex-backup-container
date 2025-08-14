@@ -8,12 +8,11 @@ set -e
 
 # Configuration
 HOSTNAME="${HOSTNAME:-$(hostname)}"
-PLEX_CONTAINER_PATTERN="${PLEX_CONTAINER_PATTERN:-plex}"
 CONFIG_PATH="${CONFIG_PATH:-/config}"
 NFS_SERVER="${NFS_SERVER:-hadm.net}"
 NFS_PATH="${NFS_PATH:-/storage}"
 NFS_MOUNT="${NFS_MOUNT:-/mnt/nfs}"
-BACKUP_PATH="${BACKUP_PATH:-/storage/backups/docker}"
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 LOG_FILE="/var/log/backup/backup.log"
 
 # Arrays to track multiple containers
@@ -52,20 +51,22 @@ cleanup() {
 # Trap to ensure cleanup on exit
 trap cleanup EXIT
 
-# Function to discover Plex containers
+# Function to discover Plex containers by image
 discover_plex_containers() {
-    log "Discovering Plex containers..."
+    log "Discovering Plex containers by image..."
     
-    # Find all containers that match the pattern
-    while IFS= read -r container; do
-        if [[ -n "$container" ]]; then
+    # Find all containers running Plex images
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            container=$(echo "$line" | cut -d' ' -f1)
+            image=$(echo "$line" | cut -d' ' -f2-)
             PLEX_CONTAINERS+=("$container")
-            log "Found Plex container: $container"
+            log "Found Plex container: $container (image: $image)"
         fi
-    done < <(docker ps -a --format "{{.Names}}" | grep -i "$PLEX_CONTAINER_PATTERN")
+    done < <(docker ps -a --format "{{.Names}} {{.Image}}" | grep -i plex)
     
     if [ ${#PLEX_CONTAINERS[@]} -eq 0 ]; then
-        error_exit "No Plex containers found matching pattern: $PLEX_CONTAINER_PATTERN"
+        error_exit "No Plex containers found (looking for containers with 'plex' in image name)"
     fi
     
     log "Total Plex containers found: ${#PLEX_CONTAINERS[@]}"
@@ -148,7 +149,6 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 log "=== Starting Multi-Plex backup process ==="
 log "Hostname: $HOSTNAME"
-log "Plex Container Pattern: $PLEX_CONTAINER_PATTERN"
 log "Config Path: $CONFIG_PATH"
 
 # Check if Docker socket is accessible
@@ -194,10 +194,9 @@ if ! mountpoint -q "$NFS_MOUNT"; then
     error_exit "NFS mount verification failed"
 fi
 
-# Create backup directory
-BACKUP_DIR="$NFS_MOUNT/backups/docker/$HOSTNAME"
-mkdir -p "$BACKUP_DIR"
-log "Backup directory: $BACKUP_DIR"
+# Create backup directory structure
+mkdir -p "$NFS_MOUNT/backups/docker"
+log "NFS backup area ready: $NFS_MOUNT/backups/docker"
 
 # Perform database maintenance (all containers share the same config directory)
 log "=== Running database maintenance on shared config directory ==="
@@ -240,10 +239,8 @@ if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
     done
 fi
 
-# Perform incremental backup of the shared config directory
-log "Starting incremental backup with rsync"
-CURRENT_DATE=$(date +%Y-%m-%d_%H-%M-%S)
-LATEST_LINK="$BACKUP_DIR/latest"
+# Perform simple rsync backup of the shared config directory
+log "Starting rsync backup of config directory"
 
 # Create exclude file for rsync
 EXCLUDE_FILE="/tmp/rsync_excludes"
@@ -269,31 +266,25 @@ if [[ ! -d "$CONFIG_PATH" ]]; then
     error_exit "Config path does not exist: $CONFIG_PATH"
 fi
 
-log "Backing up shared config directory: $CONFIG_PATH"
-BACKUP_TARGET="$BACKUP_DIR/$CURRENT_DATE"
+# Backup directly to /storage/backups/docker/$HOSTNAME/ (no timestamps)
+BACKUP_TARGET="$NFS_MOUNT/backups/docker/$HOSTNAME"
+mkdir -p "$BACKUP_TARGET"
 
-log "Creating backup: $BACKUP_TARGET"
+log "Syncing config to: $BACKUP_TARGET"
 
-# Build rsync command with proper options for incremental backup (only differences)
+# Simple rsync - just sync the differences
 rsync_cmd=(
     rsync
-    -avH
-    --numeric-ids
+    -av
     --delete
     --delete-excluded
     --exclude-from="$EXCLUDE_FILE"
-    --link-dest="$LATEST_LINK"
     "$CONFIG_PATH/"
     "$BACKUP_TARGET/"
 )
 
 if "${rsync_cmd[@]}"; then
     log "Rsync backup completed successfully"
-    
-    # Update latest symlink
-    rm -f "$LATEST_LINK"
-    ln -s "$CURRENT_DATE" "$LATEST_LINK"
-    log "Updated latest backup symlink"
     
     # Get backup size
     BACKUP_SIZE=$(du -sh "$BACKUP_TARGET" 2>/dev/null | cut -f1)
@@ -302,15 +293,7 @@ else
     error_exit "Rsync backup failed"
 fi
 
-log "Backup completed for all Plex containers (shared config)"
-
-# Cleanup old backups (keep last 7 days)
-log "Cleaning up old backups (keeping last 7 days)"
-find "$BACKUP_DIR" -maxdepth 1 -type d -name "20*" -mtime +7 -exec rm -rf {} \; 2>/dev/null || true
-
-# Generate backup report
-TOTAL_BACKUPS=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name "20*" | wc -l)
-log "Backup cleanup completed. Total backups: $TOTAL_BACKUPS"
+log "Config directory synchronized successfully"
 
 # Cleanup temporary files
 rm -f "$EXCLUDE_FILE"
@@ -318,7 +301,6 @@ rm -f "$EXCLUDE_FILE"
 log "=== Multi-Plex backup process completed successfully ==="
 log "Processed containers: ${PLEX_CONTAINERS[*]}"
 log "Backup location: $BACKUP_TARGET"
-log "Latest backup link: $LATEST_LINK"
 
 # Send success notification (optional - can be extended)
 if command -v curl >/dev/null 2>&1 && [ -n "${NOTIFICATION_URL:-}" ]; then

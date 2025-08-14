@@ -214,6 +214,31 @@ done
 
 log "Database maintenance completed for all containers"
 
+# Copy SQLite databases while Plex is stopped (they're locked when running)
+log "=== Copying SQLite databases while containers are stopped ==="
+
+# Create backup directory structure
+BACKUP_TARGET="$NFS_MOUNT/backups/docker/$HOSTNAME"
+mkdir -p "$BACKUP_TARGET"
+
+# Database paths in Plex config
+DB_BASE_PATH="$CONFIG_PATH/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+BACKUP_DB_PATH="$BACKUP_TARGET/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+
+if [[ -d "$DB_BASE_PATH" ]]; then
+    log "Copying SQLite databases from: $DB_BASE_PATH"
+    mkdir -p "$BACKUP_DB_PATH"
+    
+    # Copy all .db files and their associated files (.db-wal, .db-shm, etc.)
+    find "$DB_BASE_PATH" -name "*.db*" -type f -exec cp -v {} "$BACKUP_DB_PATH/" \; 2>/dev/null || true
+    
+    # Get count of copied database files
+    DB_COUNT=$(find "$BACKUP_DB_PATH" -name "*.db*" -type f | wc -l)
+    log "Copied $DB_COUNT SQLite database files"
+else
+    log "WARNING: Database directory not found: $DB_BASE_PATH"
+fi
+
 # Start all stopped containers back up
 for container in "${STOPPED_CONTAINERS[@]}"; do
     log "Starting Plex container back up: $container"
@@ -239,10 +264,10 @@ if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
     done
 fi
 
-# Perform simple rsync backup of the shared config directory
-log "Starting rsync backup of config directory"
+# Perform rsync backup of the remaining config files (excluding databases already copied)
+log "=== Starting rsync backup of remaining config files ==="
 
-# Create exclude file for rsync
+# Create exclude file for rsync (excluding databases we already copied)
 EXCLUDE_FILE="/tmp/rsync_excludes"
 cat > "$EXCLUDE_FILE" << EOF
 Cache/
@@ -257,6 +282,7 @@ Updates/
 *.backup.*
 *.corrupted.*
 Plug-in Support/Caches/
+Plug-in Support/Databases/
 Plug-in Support/Data/com.plexapp.system/DataItems/
 Media/localhost/
 EOF
@@ -266,13 +292,10 @@ if [[ ! -d "$CONFIG_PATH" ]]; then
     error_exit "Config path does not exist: $CONFIG_PATH"
 fi
 
-# Backup directly to /storage/backups/docker/$HOSTNAME/ (no timestamps)
-BACKUP_TARGET="$NFS_MOUNT/backups/docker/$HOSTNAME"
-mkdir -p "$BACKUP_TARGET"
+log "Syncing remaining config files to: $BACKUP_TARGET"
+log "Note: SQLite databases already copied while containers were stopped"
 
-log "Syncing config to: $BACKUP_TARGET"
-
-# Simple rsync - just sync the differences
+# Simple rsync - sync everything except databases (which we already copied)
 rsync_cmd=(
     rsync
     -av
@@ -284,16 +307,16 @@ rsync_cmd=(
 )
 
 if "${rsync_cmd[@]}"; then
-    log "Rsync backup completed successfully"
+    log "Rsync backup of config files completed successfully"
     
     # Get backup size
     BACKUP_SIZE=$(du -sh "$BACKUP_TARGET" 2>/dev/null | cut -f1)
-    log "Backup size: $BACKUP_SIZE"
+    log "Total backup size: $BACKUP_SIZE"
 else
     error_exit "Rsync backup failed"
 fi
 
-log "Config directory synchronized successfully"
+log "Config directory synchronization completed successfully"
 
 # Cleanup temporary files
 rm -f "$EXCLUDE_FILE"

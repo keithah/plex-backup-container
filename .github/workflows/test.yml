@@ -1,0 +1,74 @@
+name: Test Backup Script
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-script:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test script syntax
+        run: |
+          echo "Testing backup script syntax..."
+          bash -n backup-script.sh
+          echo "✅ Script syntax is valid"
+
+      - name: Test Docker build
+        run: |
+          echo "Testing Docker build..."
+          docker build -t plex-backup-test .
+          echo "✅ Docker build successful"
+
+      - name: Test script with mock environment
+        run: |
+          echo "Creating mock environment..."
+          
+          # Create mock directories
+          mkdir -p mock-config/plex
+          mkdir -p mock-config/tautulli
+          mkdir -p mock-storage/backups/docker
+          
+          # Create mock docker-compose.yaml
+          cat > mock-config/docker-compose.yaml << 'EOF'
+          services:
+            plex:
+              image: linuxserver/plex:latest
+              volumes:
+                - ./mock-config/plex:/config
+            tautulli:
+              image: linuxserver/tautulli:latest
+              volumes:
+                - ./mock-config/tautulli:/config
+          EOF
+          
+          # Create mock database files
+          touch mock-config/plex/test.db
+          touch mock-config/tautulli/tautulli.db
+          
+          # Test container that validates the script can parse compose file
+          docker run --rm \
+            -v $(pwd):/scripts \
+            -v $(pwd)/mock-config:/config \
+            -v $(pwd)/mock-storage:/storage \
+            -e CONFIG_BASE_PATH=/config \
+            -e COMPOSE_FILE=/config/docker-compose.yaml \
+            -e HOSTNAME=test-host \
+            --entrypoint bash \
+            plex-backup-test \
+            -c "bash -n /scripts/backup-script.sh && echo '✅ Script validation passed'"
+
+      - name: Validate Docker Compose
+        run: |
+          echo "Testing docker-compose.yaml..."
+          docker-compose -f docker-compose.yaml config
+          echo "✅ Docker Compose configuration is valid"

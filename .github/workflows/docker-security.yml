@@ -17,6 +17,7 @@ env:
 
 jobs:
   security-scan:
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
       contents: read

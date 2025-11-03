@@ -11,6 +11,7 @@ on:
 
 jobs:
   test-script:
+    timeout-minutes: 6
     runs-on: ubuntu-latest
     
     steps:

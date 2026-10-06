@@ -12,7 +12,7 @@ on:
 jobs:
   test-script:
     timeout-minutes: 6
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     
     steps:
       - name: Checkout repository
